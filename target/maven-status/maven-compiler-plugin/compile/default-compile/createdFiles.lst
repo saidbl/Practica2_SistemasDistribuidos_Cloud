@@ -1,9 +1,11 @@
 client\Client.class
-common\CloudResource.class
+client\MetricProcess$1.class
+common\Registration.class
+server\ClientHandler.class
 server\Server$1.class
-client\Client$1.class
+client\HearthBeatProcess.class
+client\MetricProcess.class
 common\MetricReport.class
 common\Message.class
-common\NodeInfo.class
 server\Server.class
 common\ResourceType.class

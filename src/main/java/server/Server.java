@@ -6,169 +6,246 @@ import java.io.*;
 import java.net.*;
 import java.util.*;
 import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class Server {
 
-    private static final int PORT = 5000;
-    private static final long TIMEOUT = 8000;
+    private static final int MAX_VM = 5;
+    private static final int MAX_CONTAINER = 8;
+    private static final int MAX_DATABASE = 3;
+    private static final int MAX_API_GATEWAY = 4;
+    private static final int MAX_STORAGE_NODE = 4;
 
-    private static final Map<String, NodeInfo> nodes = new ConcurrentHashMap<>();
-    private static final Map<ResourceType, List<CloudResource>> cluster = new ConcurrentHashMap<>();
+    private static final int PUBLIC_PORT = 5000;   
+    private static final int BUS_PORT = 6000;      
+    private static final long HEARTBEAT_TIMEOUT_MS = 8000;
 
+    private static final Map<String, ResourceType> nodeType = new ConcurrentHashMap<>();
+    private static final Map<String, Integer> lastValue = new ConcurrentHashMap<>();
+    private static final Map<String, Long> lastHeartbeat = new ConcurrentHashMap<>();
+    private static final Map<ResourceType, Long> lastScaleTime = new ConcurrentHashMap<>();
+    private static final long COOLDOWN_MS = 5000;
+
+
+    private static final Map<ResourceType, CopyOnWriteArrayList<String>> cluster = new ConcurrentHashMap<>();
+
+    private static final AtomicInteger handlerPortSeq = new AtomicInteger(7000);
 
     public static void main(String[] args) throws Exception {
+        System.out.println("CLOUD SERVER MAIN PID: " + ProcessHandle.current().pid());
+        System.out.println("Public port: " + PUBLIC_PORT + " | Internal bus port: " + BUS_PORT);
 
-        System.out.println(" CLOUD SERVER iniciado en puerto " + PORT);
-        for (ResourceType type : ResourceType.values()) {
-            cluster.put(type, new CopyOnWriteArrayList<>());
-        }
+        for (ResourceType t : ResourceType.values()) cluster.put(t, new CopyOnWriteArrayList<>());
 
-        ServerSocket serverSocket = new ServerSocket(PORT);
+        new Thread(Server::runInternalBus, "InternalBus").start();
+        new Thread(Server::monitorHeartbeats, "HeartbeatMonitor").start();
 
-        new Thread(Server::monitorNodes).start();
+        try (ServerSocket publicSocket = new ServerSocket(PUBLIC_PORT)) {
+            while (true) {
+                Socket s = publicSocket.accept();
 
-        while (true) {
-            Socket socket = serverSocket.accept();
-            new Thread(() -> handleClient(socket)).start();
+                int handlerPort = handlerPortSeq.getAndIncrement();
+
+                spawnHandler(handlerPort);
+
+                try (ObjectOutputStream out = new ObjectOutputStream(s.getOutputStream())) {
+                    out.writeObject(new Message("REDIRECT", handlerPort));
+                    out.flush();
+                } catch (Exception ignored) {
+                } finally {
+                    try { s.close(); } catch (Exception ignored) {}
+                }
+            }
         }
     }
 
-    private static void handleClient(Socket socket) {
+    private static void spawnHandler(int handlerPort) throws IOException {
+        String cp = "target/classes";
+
+        new ProcessBuilder(
+                "java", "-cp", cp,
+                "server.ClientHandler",
+                String.valueOf(handlerPort),
+                String.valueOf(BUS_PORT)
+        ).inheritIO().start();
 
         try {
-            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-            ObjectInputStream in = new ObjectInputStream(socket.getInputStream());
+            Thread.sleep(300); 
+        } catch (InterruptedException ignored) {}
+    }
+
+
+    private static void runInternalBus() {
+        try (ServerSocket bus = new ServerSocket(BUS_PORT)) {
+            System.out.println("[BUS] Listening on " + BUS_PORT);
 
             while (true) {
-
-                Message msg = (Message) in.readObject();
-
-                switch (msg.getType()) {
-
-                    case "REGISTER" -> {
-                        CloudResource resource = (CloudResource) msg.getPayload();
-                        cluster.get(resource.getType()).add(resource);
-
-                        nodes.put(resource.getId(),
-                                new NodeInfo(resource.getId(), socket, out));
-
-                        System.out.println(" Nodo conectado: " + resource.getId()
-                                + " Tipo: " + resource.getType());
-                    }
-
-                    case "HEARTBEAT" -> {
-                        String nodeId = (String) msg.getPayload();
-                        NodeInfo node = nodes.get(nodeId);
-                        if (node != null) node.updateHeartbeat();
-                    }
-
-                    case "METRIC" -> processMetric((MetricReport) msg.getPayload());
-                }
+                Socket s = bus.accept();
+                new Thread(() -> handleBusConnection(s), "BusConn-" + s.getPort()).start();
             }
-
         } catch (Exception e) {
-            System.out.println("️ Nodo desconectado.");
+            System.out.println("[BUS] ERROR: " + e.getMessage());
         }
     }
 
-    private static void processMetric(MetricReport report) {
-
-        for (List<CloudResource> list : cluster.values()) {
-
-            for (CloudResource resource : list) {
-
-                if (resource.getId().equals(report.getNodeId())) {
-
-                    resource.setLoad(report.getValue());
-
-                    System.out.println("[METRIC] "
-                            + resource.getType()
-                            + " " + resource.getId()
-                            + " Load=" + report.getValue()
-                            + " Status="+ report.getState());
-                        switch (resource.getType()) {
-
-                            case VM -> {
-                                System.out.println(resource.getStatus());
-                                if(report.getState().equals("CRITICAL")) scaleUp(resource);
-                                if(report.getState().equals("LOW")) scaleDown(resource);
-                            }
-
-                            case CONTAINER -> {
-                                if(report.getState().equals("CRITICAL")) {
-                                    scaleUp(resource);
-                                    scaleUp(resource);
-                                }
-                                if(report.getState().equals("LOW")) scaleDown(resource);
-                            }
-
-                            case DATABASE -> {
-                                if(report.getState().equals("CRITICAL")) scaleUp(resource);
-                            }
-
-                            case API_GATEWAY -> {
-                                if(report.getState().equals("CRITICAL")) scaleUp(resource);
-                                if(report.getState().equals("LOW")) scaleDown(resource);
-                            }
-
-                            case STORAGE_NODE -> {
-                                if(report.getState().equals("CRITICAL")) scaleUp(resource);
-                            }
-                        }
-                    return;
+    private static void handleBusConnection(Socket s) {
+        try (ObjectInputStream in = new ObjectInputStream(s.getInputStream())) {
+            while (true) {
+                Message msg = (Message) in.readObject();
+                switch (msg.getType()) {
+                    case "REGISTER" -> onRegister((Registration) msg.getPayload());
+                    case "HEARTBEAT" -> onHeartbeat((String) msg.getPayload());
+                    case "METRIC" -> onMetric((MetricReport) msg.getPayload());
+                    default -> { }
                 }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            try { s.close(); } catch (Exception ignored) {}
+        }
+    }
+
+    private static void onRegister(Registration reg) {
+        nodeType.put(reg.getNodeId(), reg.getType());
+
+        cluster.get(reg.getType()).addIfAbsent(reg.getNodeId());
+
+        lastHeartbeat.put(reg.getNodeId(), System.currentTimeMillis());
+
+        System.out.println("[REGISTER] node=" + reg.getNodeId()
+                + " type=" + reg.getType()
+                + " role=" + reg.getRole()
+                + " | total(" + reg.getType() + ")=" + cluster.get(reg.getType()).size());
+    }
+
+    private static void onHeartbeat(String nodeId) {
+        lastHeartbeat.put(nodeId, System.currentTimeMillis());
+    }
+
+    private static void onMetric(MetricReport r) {
+        lastValue.put(r.getNodeId(), r.getValue());
+
+        String state = calculateState(r.getType(), r.getValue());
+
+        System.out.println("[METRIC] " + r.getType() + " " + r.getNodeId()
+                + " value=" + r.getValue()
+                + " state=" + state);
+
+        applyScalingPolicy(r.getType(), state);
+    }
+    private static String calculateState(ResourceType type, int v) {
+        return switch (type) {
+            case VM -> (v > 80) ? "CRITICAL" : (v < 30) ? "LOW" : "NORMAL";
+            case CONTAINER -> (v > 70) ? "CRITICAL" : (v < 20) ? "LOW" : "NORMAL";
+            case DATABASE -> (v >= 100) ? "CRITICAL" : "NORMAL";
+            case API_GATEWAY -> (v > 200) ? "CRITICAL" : (v < 80) ? "LOW" : "NORMAL";
+            case STORAGE_NODE -> (v >= 85) ? "CRITICAL" : "NORMAL";
+        };
+    }
+
+    private static void applyScalingPolicy(ResourceType type, String state) {
+
+        long now = System.currentTimeMillis();
+        long last = lastScaleTime.getOrDefault(type, 0L);
+
+        if (now - last < COOLDOWN_MS) return;
+
+        if ("CRITICAL".equals(state)) {
+
+            lastScaleTime.put(type, now);
+
+            switch (type) {
+                case VM -> scaleUp(type, 1);
+                case CONTAINER -> scaleUp(type, 2);
+                case DATABASE -> scaleUp(type, 1);
+                case API_GATEWAY -> scaleUp(type, 1);
+                case STORAGE_NODE -> scaleUp(type, 1);
+            }
+        }
+
+        if ("LOW".equals(state)) {
+
+            lastScaleTime.put(type, now);
+
+            switch (type) {
+                case VM, CONTAINER, API_GATEWAY -> scaleDown(type, 1);
+                default -> {}
             }
         }
     }
 
-    private static void scaleUp(CloudResource resource) {
+    private static void scaleUp(ResourceType type, int count) {
 
-        List<CloudResource> resources = cluster.get(resource.getType());
+        int maxLimit = switch(type) {
+            case VM -> MAX_VM;
+            case CONTAINER -> MAX_CONTAINER;
+            case DATABASE -> MAX_DATABASE;
+            case API_GATEWAY -> MAX_API_GATEWAY;
+            case STORAGE_NODE -> MAX_STORAGE_NODE;
+        };
 
-        String newId = resource.getType() + "-AUTO-" + UUID.randomUUID().toString().substring(0,4);
+        CopyOnWriteArrayList<String> list = cluster.get(type);
 
-        CloudResource newReplica = new CloudResource(newId, resource.getType());
+        if (list.size() >= maxLimit) {
+            System.out.println("[SCALE-UP BLOCKED] Max limit reached for " + type);
+            return;
+        }
 
-        resources.add(newReplica);
+        for (int i = 0; i < count; i++) {
 
-        System.out.println(" NUEVA INSTANCIA CREADA: " + newId);
-        System.out.println("Total instancias " + resource.getType() + ": " + resources.size());
-    }
-    
-    private static void scaleDown(CloudResource resource) {
+            if (list.size() >= maxLimit) break;
 
-        List<CloudResource> resources = cluster.get(resource.getType());
+            String replicaId = type + "-AUTO-" +
+                    UUID.randomUUID().toString().substring(0, 4);
 
-        if (resources.size() > 1) {
+            list.add(replicaId);
 
-            CloudResource removed = resources.remove(resources.size() - 1);
-
-            System.out.println("Instancia eliminada: " + removed.getId());
-            System.out.println("Total instancias " + resource.getType() + ": " + resources.size());
+            System.out.println("[SCALE-UP] Created " + replicaId +
+                    " | total(" + type + ")=" + list.size());
         }
     }
 
 
+    private static void scaleDown(ResourceType type, int count) {
+        CopyOnWriteArrayList<String> list = cluster.get(type);
 
+        for (int i = 0; i < count; i++) {
+            if (list.size() <= 1) return;
 
-    private static void monitorNodes() {
+            int idx = findAutoReplicaIndex(list);
+            String removed = (idx >= 0) ? list.remove(idx) : list.remove(list.size() - 1);
 
+            System.out.println("[SCALE-DOWN] Removed " + removed
+                    + " | total(" + type + ")=" + list.size());
+        }
+    }
+
+    private static int findAutoReplicaIndex(List<String> list) {
+        for (int i = list.size() - 1; i >= 0; i--) {
+            if (list.get(i).contains("-AUTO-")) return i;
+        }
+        return -1;
+    }
+
+    private static void monitorHeartbeats() {
         while (true) {
-
             long now = System.currentTimeMillis();
 
-            nodes.values().removeIf(node -> {
-                if (now - node.getLastHeartbeat() > TIMEOUT) {
+            for (String nodeId : new ArrayList<>(lastHeartbeat.keySet())) {
+                long last = lastHeartbeat.getOrDefault(nodeId, 0L);
+                if (now - last > HEARTBEAT_TIMEOUT_MS) {
+                    ResourceType t = nodeType.get(nodeId);
+                    System.out.println("[FAILURE] Node down: " + nodeId + " type=" + t);
 
-                    System.out.println(" Nodo caído: " + node.getNodeId());
+                    lastHeartbeat.remove(nodeId);
+                    lastValue.remove(nodeId);
+                    nodeType.remove(nodeId);
 
-                    nodes.remove(node.getNodeId());
-                    return true;
+                    if (t != null) cluster.get(t).remove(nodeId);
                 }
-                return false;
-            });
+            }
 
-            try { Thread.sleep(3000); } catch (Exception ignored) {}
+            try { Thread.sleep(2000); } catch (Exception ignored) {}
         }
     }
 }
